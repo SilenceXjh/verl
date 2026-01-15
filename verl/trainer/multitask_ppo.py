@@ -241,11 +241,8 @@ class MultiLoraTaskRunner(TaskRunner):
         tasks_config = {}
         for i, task_config in enumerate(tasks_list):
             merged_config = OmegaConf.merge(base_config, task_config)
-
-            # Generate task ID if not provided
             task_id = task_config.get("task_id", f"task_{i}")
             merged_config.task_id = task_id
-        
             tasks_config[task_id] = merged_config
 
         # Instantiate the tokenizer and processor.

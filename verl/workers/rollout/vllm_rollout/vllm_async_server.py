@@ -365,7 +365,7 @@ class vLLMHttpServerBase:
                 server_args.append(json.dumps(v) if isinstance(v, dict) else str(v))
 
         if self.replica_rank == 0:
-            pprint(server_args)
+            pprint("[VLLM server args]", server_args)
 
         CMD_MODULES = [vllm.entrypoints.cli.serve]
         parser = FlexibleArgumentParser(description="vLLM CLI")

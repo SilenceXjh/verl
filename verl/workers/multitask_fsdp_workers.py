@@ -5,7 +5,7 @@ import copy
 from omegaconf import OmegaConf, open_dict
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from verl.workers.config.engine import FSDPEngineConfig
-from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker, CriticWorker, get_sharding_strategy
+from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker, get_sharding_strategy
 from verl.utils.fs import copy_to_local
 from verl.workers.config.optimizer import build_optimizer
 from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -29,7 +29,7 @@ import warnings
 
 logger = logging.getLogger(__file__)
 
-class MultiTaskActorRolloutRefWorker(AsyncActorRolloutRefWorker):
+class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
     def __init__(self, config, tasks_config, role, **kwargs):
         # Initialize with the base config
         super().__init__(config, role, **kwargs)

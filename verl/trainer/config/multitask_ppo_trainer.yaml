@@ -24,6 +24,7 @@ tasks:
         target_modules: all-linear
     trainer:
       experiment_name: multitask_lora_rank16_alpha32
+      train_epochs: 3
 
   - task_id: lora_large
     data:
@@ -43,3 +44,4 @@ tasks:
         target_modules: all-linear
     trainer:
       experiment_name: multitask_lora_rank32_alpha64
+      train_epochs: 3

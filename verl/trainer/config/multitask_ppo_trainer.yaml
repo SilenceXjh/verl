@@ -6,7 +6,8 @@ defaults:
 # Pre-seed with two empty entries so CLI overrides like tasks.0.* / tasks.1.* work without errors.
 # Users can still append more tasks with +tasks.2.*, +tasks.3.*, etc.
 tasks:
-  - task_id: lora_small
+  - task_id: 0
+    task_name: lora_small
     data:
       train_files: ./data/gsm8k/train.parquet
       val_files: ./data/gsm8k/test.parquet
@@ -22,11 +23,13 @@ tasks:
         lora_rank: 16
         lora_alpha: 32
         target_modules: all-linear
+        lora_int_id: 1
     trainer:
       experiment_name: multitask_lora_rank16_alpha32
       train_epochs: 3
 
-  - task_id: lora_large
+  - task_id: 1
+    task_name: lora_large
     data:
       train_files: ./data/gsm8k/train.parquet
       val_files: ./data/gsm8k/test.parquet
@@ -42,6 +45,7 @@ tasks:
         lora_rank: 32
         lora_alpha: 64
         target_modules: all-linear
+        lora_int_id: 2
     trainer:
       experiment_name: multitask_lora_rank32_alpha64
       train_epochs: 3

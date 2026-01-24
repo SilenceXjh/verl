@@ -41,23 +41,18 @@ Usage:
 
 import os
 import socket
-from typing import List, Optional, Union
 
 import hydra
 import ray
-import torch
-from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
+from omegaconf import ListConfig, OmegaConf
 
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.main_ppo import TaskRunner
 from verl.trainer.ppo.reward import load_reward_manager
-from verl.trainer.ppo.multitask_ray_trainer import MultiTaskRayPPOTrainer, ResourcePoolManager
+from verl.trainer.ppo.multitask_ray_trainer import MultiTaskRayPPOTrainer
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
-from verl.workers.multitask_fsdp_workers import MultiTaskActorRolloutRefWorker, MultiTaskCriticWorker
 from verl.utils.device import auto_set_ascend_device_name, is_cuda_available
-from verl.utils import hf_tokenizer, hf_processor
-from verl.trainer.ppo.ray_trainer import Role
 
 @hydra.main(config_path="config", config_name="multitask_ppo_trainer", version_base=None)
 def main(config):
@@ -134,7 +129,7 @@ def run_multitask_ppo(config):
 
 class MultiLoraTaskRunner(TaskRunner):
     def add_actor_rollout_worker(self, config):
-        """Add actor rollout worker. Currently, only choose MultiTaskActorRolloutRefWorker"""
+        """Add actor rollout ref worker. Currently, only choose MultiTaskActorRolloutRefWorker"""
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
 
@@ -149,8 +144,8 @@ class MultiLoraTaskRunner(TaskRunner):
         else:
             raise NotImplementedError
 
-        self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
-        self.mapping[Role.ActorRollout] = "global_pool"
+        self.role_worker_mapping[Role.ActorRolloutRef] = ray.remote(actor_rollout_cls)
+        self.mapping[Role.ActorRolloutRef] = "global_pool"
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
@@ -203,8 +198,8 @@ class MultiLoraTaskRunner(TaskRunner):
         # The reward type depends on the tag of the data
         self.add_reward_model_worker(config)
 
-        # Add a reference policy worker if KL loss or KL reward is used.
-        self.add_ref_policy_worker(config, actor_rollout_cls)
+        # ref police is in actor rollout worker
+        # self.add_ref_policy_worker(config, actor_rollout_cls)
 
         # validate config
         validate_config(
@@ -241,7 +236,7 @@ class MultiLoraTaskRunner(TaskRunner):
         tasks_config = {}
         for i, task_config in enumerate(tasks_list):
             merged_config = OmegaConf.merge(base_config, task_config)
-            task_id = task_config.get("task_id", f"task_{i}")
+            task_id = task_config.get("task_id", i)
             merged_config.task_id = task_id
             tasks_config[task_id] = merged_config
 
@@ -270,6 +265,7 @@ class MultiLoraTaskRunner(TaskRunner):
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
+        print("[DEBUG] role worker mapping:", self.role_worker_mapping)
         trainer = MultiTaskRayPPOTrainer(
             config=base_config,
             tasks_config=tasks_config,
@@ -288,7 +284,7 @@ class MultiLoraTaskRunner(TaskRunner):
         trainer.init_workers()
 
         # Start the training process.
-        trainer.fit()
+        # trainer.fit()
 
 if __name__ == "__main__":
     main()

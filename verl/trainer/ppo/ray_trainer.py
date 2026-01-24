@@ -747,6 +747,19 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+    
+    def _get_ray_actor_rollout_cls(self, actor_role):
+        return RayClassWithInitArgs(
+            cls=self.role_worker_mapping[actor_role],
+            config=self.config.actor_rollout_ref,
+            role=str(actor_role),
+        )
+    
+    def _get_ray_critic_cls(self, critic_cls, critic_config):
+        return RayClassWithInitArgs(
+            cls=critic_cls,
+            config=critic_config,
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -763,11 +776,7 @@ class RayPPOTrainer:
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[actor_role],
-                config=self.config.actor_rollout_ref,
-                role=str(actor_role),
-            )
+            actor_rollout_cls = self._get_ray_actor_rollout_cls(actor_role)
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
         else:
             raise NotImplementedError
@@ -800,7 +809,8 @@ class RayPPOTrainer:
                     checkpoint_config=orig_critic_cfg.checkpoint,
                 )
 
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            #critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            critic_cls = self._get_ray_critic_cls(self.role_worker_mapping[Role.Critic], critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
         # create reference policy if needed

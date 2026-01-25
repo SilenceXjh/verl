@@ -1,4 +1,5 @@
 from asyncio import get_event_loop
+import asyncio
 from typing import Dict
 import torch
 import logging
@@ -10,7 +11,7 @@ from verl.protocol import DataProto
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.profiler.performance import simple_timer
+from verl.utils.profiler.performance import reduce_timing, simple_timer, topk_reduce_ratio_min_max
 from verl.utils.profiler.profile import DistProfiler
 from verl.workers.config.engine import FSDPEngineConfig
 from verl.workers.config.model import HFModelConfig
@@ -23,20 +24,26 @@ from verl.single_controller.base.decorator import make_nd_compute_dataproto_disp
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import CPUOffload, MixedPrecision
 from verl.utils.py_functional import convert_to_regular_types
-from verl.utils.model import print_model_size, get_generation_config, update_model_config, load_valuehead_model
+from verl.utils.model import convert_weight_keys, print_model_size, get_generation_config, update_model_config, load_valuehead_model
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils import hf_tokenizer, hf_processor
 from verl.utils.torch_dtypes import PrecisionType
-from verl.utils.fsdp_utils import collect_lora_params, fsdp_version, get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager, apply_fsdp2, fsdp2_load_full_state_dict, get_shard_placement_fn, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu, offload_fsdp_optimizer
+from verl.utils.fsdp_utils import collect_lora_params, collect_task_lora_params, fsdp_version, get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager, apply_fsdp2, fsdp2_load_full_state_dict, get_shard_placement_fn, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu, offload_fsdp_optimizer, replace_lora_wrapper
 from verl.utils.import_utils import import_external_libs
 from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.fsdp_utils import CPUOffloadPolicy, MixedPrecisionPolicy
-from verl.utils.device import get_device_id, get_device_name, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, set_expandable_segments
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq, AutoModelForImageTextToText
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 import warnings
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+
+try:
+    # for torch 2.5+
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
 
 from verl.workers.rollout.vllm_rollout.multilora_vllm_rollout import MultiLoraVLLMRollout
 
@@ -839,6 +846,7 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
     def generate_sequences_multi_lora(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
+        print("multi-lora worker generate.")
         prompts = prompts.to(get_device_id())
 
         meta_info = {
@@ -853,12 +861,13 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            loop = get_event_loop()
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences_multi_lora", timing_generate):
-            output = self.rollout.generate_sequences_multi_lora(batches)
+            output = self.rollout.generate_sequences_multi_lora(prompts)
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -867,7 +876,7 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
-            timing_generate["generate_sequences"]
+            timing_generate["generate_sequences_multi_lora"]
         )
         timing_generate = reduce_timing(timing_generate)
         timing_generate.update(
@@ -893,23 +902,29 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
-        peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        if hasattr(peft_model, "peft_config"):  # LoRA
-            peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
+        peft_config = peft_model.peft_config
+
+        # collect all the adapters in peft model
+        adapter_params = {}
+        for adapter_name in peft_config.keys():
+            lora_config = peft_config[adapter_name]
+            params = collect_task_lora_params(
                 module=self.actor_module_fsdp,
                 layered_summon=self.config.rollout.get("layered_summon", False),
                 base_sync_done=self.base_sync_done,
+                adapter_name=adapter_name
             )
             if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
-        else:
-            params = self.actor_module_fsdp.state_dict()
+                params = {replace_lora_wrapper(k, lora_config): v for k, v in params.items()}
 
-        params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        )
+            params = convert_weight_keys(
+                params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+
+            adapter_params[adapter_name] = params
+
+            print(f"adapter {adapter_name} params: {len(params)}")
 
         # Special handling for LoRA with sleep_level=2:
         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
@@ -921,10 +936,11 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
                 layered_summon=self.layered_summon,
                 base_sync_done=False,
             )
-            base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
+            # base_model_params = {replace_lora_wrapper(k, lora_config): v for k, v in base_model_params.items()}
             base_model_params = convert_weight_keys(
                 base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
             )
+            print("base model params:", len(base_model_params))
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
@@ -933,30 +949,38 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
 
         set_expandable_segments(False)
 
-        if peft_config is not None and self.base_sync_done:
-            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
-        else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in params.items()
-            )
-
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
+        # vllm update base model params
         if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
             per_tensor_base_params = (
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in base_model_params.items()
             )
-            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+            await self.rollout.update_base_weights(per_tensor_base_params)
             del base_model_params, per_tensor_base_params
 
-        await self.rollout.update_lora_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        # vllm update lora params
+        for adapter_name in adapter_params.keys():
+            params = adapter_params[adapter_name]
+            if peft_config is not None and self.base_sync_done:
+                per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
+            else:
+                device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+                per_tensor_param = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in params.items()
+                )
+            
+            lora_config = peft_config[adapter_name]
+            task_id = int(adapter_name[len(ADAPTER_NAME_PREFIX):])
+            await self.rollout.update_lora_weights(per_tensor_param, task_id=task_id, peft_config=lora_config, base_sync_done=self.base_sync_done)
+            del params, per_tensor_param
+
+        del adapter_params
         log_gpu_memory_usage("After update_weights", logger=logger)
-        del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
@@ -966,7 +990,6 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
-
 
 
 

@@ -84,11 +84,11 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.utils import (
-    VLLM_LORA_INT_ID,
-    VLLM_LORA_NAME,
-    VLLM_LORA_PATH,
     get_vllm_max_lora_rank,
 )
+
+VLLM_LORA_NAME_PREFIX = "vllm_lora_"
+VLLM_LORA_PATH_PREFIX = "vllm_lora_path_"
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -288,14 +288,14 @@ class MultiLoraVLLMRollout(BaseRollout):
 
     @GPUMemoryLogger(role="multi-lora vllm rollout", logger=logger)
     @torch.no_grad()
-    def generate_sequences_multi_lora(self, batches: DataProto, **kwargs) -> DataProto:
-        """Generate sequences for a batch of prompts. These prompts are from different tasks. 
+    def generate_sequences_multi_lora(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generate sequences for a batch of prompts.
 
         Args:
-            batches: Input batch(DataProto), 
+            batch (DataProto): Input batch.
 
         Returns:
-            task_id -> Output batch(DataProto) which contains
+            DataProto: Output batch.
             - prompts: [bsz, prompt_length], prompt token ids from dataset.
             - responses: [bsz, response_length], output token ids include response tokens
               from LLM generation and observation tokens from tool_calls.
@@ -309,55 +309,37 @@ class MultiLoraVLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
+        # left-padded attention_mask
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
 
-        vllm_inputs = []
-        lora_requests = []
-        task_id_list = []
-        batch_size_list = []
+        task_ids = prompts.batch["task_id"]
 
-        # extract batch data from all tasks
-        for task_id, prompts in batches.items():
-            idx = prompts.batch["input_ids"]  # (bs, prompt_length)
-            # left-padded attention_mask
-            attention_mask = prompts.batch["attention_mask"]
-            position_ids = prompts.batch["position_ids"]
+        # used to construct attention_mask
+        eos_token_id = prompts.meta_info["eos_token_id"]
 
-            # used to construct attention_mask
-            eos_token_id = prompts.meta_info["eos_token_id"]
+        batch_size = idx.size(0)
 
-            batch_size = idx.size(0)
+        non_tensor_batch = prompts.non_tensor_batch
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
+            )
 
-            non_tensor_batch = prompts.non_tensor_batch
-            if "raw_prompt_ids" not in non_tensor_batch:
-                non_tensor_batch["raw_prompt_ids"] = np.array(
-                    [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
-                )
+        if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
+            raise RuntimeError("vllm sharding manager is not work properly.")
 
-            if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
-                raise RuntimeError("vllm sharding manager is not work properly.")
-
-            task_id_list.append(task_id)
-            batch_size_list.append(batch_size)
-
-            # get vllm inputs
-            if "multi_modal_data" in non_tensor_batch:
-                for raw_prompt_ids, multi_modal_data in zip(
-                    non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), strict=True
-                ):
-                    vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
-            else:
-                vllm_inputs.extend([
-                    {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
-                ])
-
-            # get lora requests
-            task_cfg = self.tasks_config[task_id]
-            lora_int_id = task_cfg.actor_rollout_ref.model.lora_int_id
-            lora_path = task_id + "_lora_path"
-            cur_lora_requests = [
-                LoRARequest(lora_name=task_id, lora_int_id=lora_int_id, lora_path=lora_path)
-            ] * batch_size
-            lora_requests.extend(cur_lora_requests)
+        if "multi_modal_data" in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(
+                non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), strict=True
+            ):
+                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+        else:
+            vllm_inputs = [
+                {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
+            ]
 
         for input_data in vllm_inputs:
             # Ensure token IDs are lists or numpy arrays
@@ -388,7 +370,16 @@ class MultiLoraVLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
-        # batches from all tasks are fed into vllm engine together
+        # construct lora requests
+        lora_requests = []
+        for task_id in task_ids:
+            task_id = task_id.item()
+            lora_name = VLLM_LORA_NAME_PREFIX + str(task_id)
+            lora_int_id = self.tasks_config[task_id].actor_rollout_ref.model.lora_int_id
+            lora_path = VLLM_LORA_PATH_PREFIX + str(task_id)
+            lora_requests.append(LoRARequest(lora_name=lora_name, lora_int_id=lora_int_id, lora_path=lora_path))
+
+        # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
@@ -397,24 +388,12 @@ class MultiLoraVLLMRollout(BaseRollout):
                 use_tqdm=False,
             )
 
-        results = {} # task_id -> DataProto
-
-        # split the outputs into their corresponding tasks
-        start_index = 0
-        for i in range(len(task_id_list)):
-            task_id = task_id_list[i]
-            cur_batch_size = batch_size_list[i]
-            end_index = start_index + cur_batch_size
-            cur_outputs = outputs[start_index:end_index]
-            start_index = end_index
-
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
-            # process outputs in current task
             response = []
             rollout_log_probs = []
-            for output in cur_outputs:
+            for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
@@ -435,41 +414,41 @@ class MultiLoraVLLMRollout(BaseRollout):
 
             seq = torch.cat([idx, response], dim=-1)
 
-            response_length = response.size(1)
-            delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-            delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-            if position_ids.dim() == 3:  # qwen2vl mrope (batch size, 4, seq len)
-                delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope (batch size, 4, seq len)
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
 
-            # TODO(sgm): fix position_ids on right_pad
-            # prompt: left pad + response: right pad
-            # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-            # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-            response_position_ids = position_ids[..., -1:] + delta_position_id
-            position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-            response_attention_mask = get_response_mask(
-                response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
-            )
-            attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+        response_position_ids = position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
-            # all the tp ranks should contain the same data here. data in all ranks are valid
-            batch = TensorDict(
-                {
-                    "prompts": idx,
-                    "responses": response,
-                    "input_ids": seq,  # here input_ids become the whole sentences
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                },
-                batch_size=batch_size,
-            )
-            if self.config.calculate_log_probs:
-                # we will recompute old log prob with actor
-                batch["rollout_log_probs"] = rollout_log_probs
-            
-            results[task_id] = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict(
+            {
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,  # here input_ids become the whole sentences
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "task_id": task_ids
+            },
+            batch_size=batch_size,
+        )
+        if self.config.calculate_log_probs:
+            # we will recompute old log prob with actor
+            batch["rollout_log_probs"] = rollout_log_probs
 
-        return results
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
@@ -501,18 +480,27 @@ class MultiLoraVLLMRollout(BaseRollout):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         
-        lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
+        pass
+
+    async def update_base_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
+        print(f"vLLM load base model weights, loaded_params: {len(weights)}")
+        model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        model.load_weights(weights)
+        
+    async def update_lora_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], task_id, peft_config, **kwargs):
+        lora_name = VLLM_LORA_NAME_PREFIX + str(task_id)
+        lora_int_id = self.tasks_config[task_id].actor_rollout_ref.model.lora_int_id
+        lora_path = VLLM_LORA_PATH_PREFIX + str(task_id)
         lora_reqest = TensorLoRARequest(
-            lora_name=f"{lora_int_id}",
+            lora_name=lora_name,
             lora_int_id=lora_int_id,
-            lora_path="simon_lora_path",
+            lora_path=lora_path,
             peft_config=asdict(peft_config),
             lora_tensors=dict(weights),
         )
         self.inference_engine.llm_engine.add_lora(lora_reqest)
+        print(f"vLLM {lora_name} load weights, loaded_params: {len(weights)}")
         logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
-        
-
 
 # https://github.com/vllm-project/vllm/issues/13175
 def _monkey_patch_compute_logits(model, vocab_size: int):

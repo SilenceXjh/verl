@@ -26,7 +26,7 @@ import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
-import tqdm
+from tqdm import tqdm
 
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -197,21 +197,6 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Error: {e}")
 
-    # overwrite this func as init args are different for MultiTaskActorRolloutRefWorker
-    def _get_ray_actor_rollout_cls(self, actor_role):
-        return RayClassWithInitArgs(
-            cls=self.role_worker_mapping[actor_role],
-            config=self.config.actor_rollout_ref,
-            tasks_config=self.tasks_config,
-            role=str(actor_role),
-        )
-    
-    def _get_ray_critic_cls(self, critic_cls, critic_config):
-        return RayClassWithInitArgs(
-            cls=critic_cls,
-            config=critic_config,
-            tasks_config=self.tasks_config,
-        )
     
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -228,7 +213,8 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
-            actor_rollout_cls = self._get_ray_actor_rollout_cls(actor_role)
+            actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[actor_role], 
+                                                     config=self.config.actor_rollout_ref, tasks_config=self.tasks_config, role=str(actor_role))
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
         else:
             raise NotImplementedError
@@ -261,8 +247,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                     checkpoint_config=orig_critic_cfg.checkpoint,
                 )
 
-            #critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-            critic_cls = self._get_ray_critic_cls(self.role_worker_mapping[Role.Critic], critic_cfg)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg, tasks_config=self.tasks_config)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
         # create reference policy if needed
@@ -375,6 +360,8 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
 
+        self.async_rollout_mode = False
+
 
     def fit(self):
         """
@@ -447,7 +434,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                     (batch_size,),
                     task_id,
                     dtype=torch.long,
-                    device=batch.device,
+                    device=batch.batch.device,
                 )
                 gen_batch.batch.set("task_id", task_id_tensor)
 
@@ -463,6 +450,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                 print("all tasks finished!")
                 break
             total_gen_batch = DataProto.concat(gen_batch_list)
+            print("total gen batch task id:", total_gen_batch.batch.get("task_id").shape, total_gen_batch.batch.get("task_id"))
 
             metrics = {}
             timing_raw = {}

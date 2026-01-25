@@ -284,7 +284,7 @@ class MultiLoraTaskRunner(TaskRunner):
         trainer.init_workers()
 
         # Start the training process.
-        # trainer.fit()
+        trainer.fit()
 
 if __name__ == "__main__":
     main()

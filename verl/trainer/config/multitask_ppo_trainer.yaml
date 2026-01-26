@@ -27,6 +27,7 @@ tasks:
     trainer:
       experiment_name: multitask_lora_rank16_alpha32
       train_epochs: 3
+      validation_data_dir: lora_small_validation_data_dir
 
   - task_id: 1
     task_name: lora_large
@@ -49,3 +50,4 @@ tasks:
     trainer:
       experiment_name: multitask_lora_rank32_alpha64
       train_epochs: 3
+      validation_data_dir: lora_large_validation_data_dir

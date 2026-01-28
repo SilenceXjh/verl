@@ -171,7 +171,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
             
             task_steps = len(self.train_dataloaders[task_id]) * self.tasks_config[task_id].trainer.train_epochs
             self.task_total_steps[task_id] = task_steps
-            total_training_steps += task_steps
+            total_training_steps = max(total_training_steps, task_steps)
             print(f"Task {task_id}: Train size={len(self.train_dataloaders[task_id])}, Val size={len(self.val_dataloaders[task_id])}")
 
             # inject per-task total_training_steps for schedulers
@@ -610,7 +610,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
         self.global_steps = 0
 
         # load checkpoint before doing anything
-        self._load_checkpoint()
+        # self._load_checkpoint()
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -680,26 +680,23 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                 break
 
             total_gen_batch = DataProto.concat(gen_batch_list)
-            print("total gen batch task id:", total_gen_batch.batch.get("task_id").shape, total_gen_batch.batch.get("task_id"))
+            # print("total gen batch task id:", total_gen_batch.batch.get("task_id").shape, total_gen_batch.batch.get("task_id"))
 
-            metrics = {}
-            for task_id in cur_batches.keys():
-                metrics[task_id] = {}
-            timing_raw = {}
+            total_timing_raw = {}
 
-            with marked_timer("start_profile", timing_raw):
+            with marked_timer("start_profile", total_timing_raw):
                 self._start_profiling(
                     not prev_step_profile and curr_step_profile
                     if self.config.global_profiler.profile_continuous_steps
                     else curr_step_profile
                 )
 
-            with marked_timer("step", timing_raw):
+            with marked_timer("step", total_timing_raw):
                     # generate a batch
-                with marked_timer("gen", timing_raw, color="red"):
+                with marked_timer("gen", total_timing_raw, color="red"):
                     gen_batch_output = self.actor_rollout_wg.generate_sequences_multi_lora(total_gen_batch)
                         
-                    timing_raw.update(gen_batch_output.meta_info["timing"])
+                    total_timing_raw.update(gen_batch_output.meta_info["timing"])
                     gen_batch_output.meta_info.pop("timing", None)
 
                 def split_by_task_id(dp: DataProto) -> dict[int, DataProto]:
@@ -725,6 +722,9 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                 # print("gen_batch_output_dict:", gen_batch_output_dict)
 
                 for task_id in cur_batches.keys():
+                    timing_raw = {}
+                    metrics = {}
+
                     batch = cur_batches[task_id]
                     batch = batch.union(gen_batch_output_dict[task_id])
 
@@ -790,14 +790,14 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                                 "actor/entropy": entropy_agg.detach().item(),
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
-                            metrics[task_id].update(old_log_prob_metrics)
+                            metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                metrics[task_id].update(calculate_debug_metrics(batch))
+                                metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
@@ -828,7 +828,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
-                            metrics[task_id].update(kl_metrics)
+                            metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
@@ -845,7 +845,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                             # Compute IS weights, apply rejection sampling, compute metrics
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
-                            metrics[task_id].update(is_metrics)
+                            metrics.update(is_metrics)
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
@@ -867,7 +867,7 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics[task_id].update(critic_output_metrics)
+                        metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -875,88 +875,90 @@ class MultiTaskRayPPOTrainer(RayPPOTrainer):
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics[task_id].update(actor_output_metrics)
+                        metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
-                # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (self.global_steps % self.config.trainer.test_freq == 0)
-                ):
-                    with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate(task_id)
-                    metrics[task_id].update(val_metrics)
+                    # validate
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        with marked_timer("testing", timing_raw, color="green"):
+                            val_metrics: dict = self._validate(task_id)
+                        metrics.update(val_metrics)
 
-                # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-                esi_close_to_expiration = should_save_ckpt_esi(
-                    max_steps_duration=self.max_steps_duration,
-                    redundant_time=self.config.trainer.esi_redundant_time,
-                )
-                # Check if the conditions for saving a checkpoint are met.
-                # The conditions include a mandatory condition (1) and
-                # one of the following optional conditions (2/3/4):
-                # 1. The save frequency is set to a positive value.
-                # 2. It's the last training step.
-                # 3. The current step number is a multiple of the save frequency.
-                # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                if self.config.trainer.save_freq > 0 and (
-                    self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-                ):
-                    if esi_close_to_expiration:
-                        print("Force saving checkpoint: ESI instance expiration approaching.")
-                    with marked_timer("save_checkpoint", timing_raw, color="green"):
-                        self._save_checkpoint(task_id)
-
-                with marked_timer("stop_profile", timing_raw):
-                    next_step_profile = (
-                        self.global_steps + 1 in self.config.global_profiler.steps
-                        if self.config.global_profiler.steps is not None
-                        else False
+                    # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                    esi_close_to_expiration = should_save_ckpt_esi(
+                        max_steps_duration=self.max_steps_duration,
+                        redundant_time=self.config.trainer.esi_redundant_time,
                     )
-                    self._stop_profiling(
-                        curr_step_profile and not next_step_profile
-                        if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
+                    # Check if the conditions for saving a checkpoint are met.
+                    # The conditions include a mandatory condition (1) and
+                    # one of the following optional conditions (2/3/4):
+                    # 1. The save frequency is set to a positive value.
+                    # 2. It's the last training step.
+                    # 3. The current step number is a multiple of the save frequency.
+                    # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                    if self.config.trainer.save_freq > 0 and (
+                        self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                    ):
+                        if esi_close_to_expiration:
+                            print("Force saving checkpoint: ESI instance expiration approaching.")
+                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                            self._save_checkpoint(task_id)
+
+                    # training metrics
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                        }
                     )
-                    prev_step_profile = curr_step_profile
-                    curr_step_profile = next_step_profile
+                    # collect metrics
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    # TODO: implement actual tflpo and theoretical tflpo
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    # metrics[task_id].update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                    # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
-                # training metrics
-                metrics[task_id].update(
-                    {
-                        "training/global_step": self.global_steps,
-                    }
-                )
-                # collect metrics
-                metrics[task_id].update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics[task_id].update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                # metrics[task_id].update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+                    # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+                    # if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                    #     self.train_dataloader.sampler.update(batch=batch)
 
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
-                # if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
-                #     self.train_dataloader.sampler.update(batch=batch)
+                    # TODO: make a canonical logger that supports various backend
+                    print(f"metrics of task {task_id} at step {self.global_steps}: {metrics}")
+                    # logger.log(data=metrics[task_id], step=self.global_steps)
 
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-
-                if (
-                    hasattr(self.config.actor_rollout_ref.actor, "profiler")
-                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
-                ):
-                    self.actor_rollout_wg.dump_memory_snapshot(
-                        tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
-                    )
+                    if (
+                        hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                        and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                    ):
+                        self.actor_rollout_wg.dump_memory_snapshot(
+                            tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
+                        )
             
+            with marked_timer("stop_profile", total_timing_raw):
+                next_step_profile = (
+                    self.global_steps + 1 in self.config.global_profiler.steps
+                    if self.config.global_profiler.steps is not None
+                    else False
+                )
+                self._stop_profiling(
+                    curr_step_profile and not next_step_profile
+                    if self.config.global_profiler.profile_continuous_steps
+                    else curr_step_profile
+                )
+                prev_step_profile = curr_step_profile
+                curr_step_profile = next_step_profile
+
             # steps_duration = timing_raw["step"]
             # self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+            print("total timing raw:", total_timing_raw)
 
             progress_bar.update(1)
             self.global_steps += 1

@@ -129,3 +129,5 @@ logs
 log
 outputs
 .history
+
+*validation_data_dir

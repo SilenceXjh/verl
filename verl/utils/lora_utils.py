@@ -1,0 +1,1 @@
+ADAPTER_NAME_PREFIX = "lora_"

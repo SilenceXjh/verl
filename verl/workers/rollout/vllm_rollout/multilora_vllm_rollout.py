@@ -150,7 +150,7 @@ class MultiLoraVLLMRollout(BaseRollout):
         self.lora_kwargs = (
             {"enable_lora": True, "max_loras": num_tasks, "max_lora_rank": get_vllm_max_lora_rank(max_lora_rank)}
         )
-        print(f"[DEBUG] vllm lora kwargs: {self.lora_kwargs}")
+        # print(f"[DEBUG] vllm lora kwargs: {self.lora_kwargs}")
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
@@ -483,7 +483,7 @@ class MultiLoraVLLMRollout(BaseRollout):
         pass
 
     async def update_base_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
-        print(f"vLLM load base model weights, loaded_params: {len(weights)}")
+        print(f"vLLM load base model weights")
         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         model.load_weights(weights)
         

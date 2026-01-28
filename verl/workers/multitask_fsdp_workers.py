@@ -1,5 +1,7 @@
 from asyncio import get_event_loop
 import asyncio
+from dataclasses import asdict
+import json
 from typing import Dict
 import torch
 import logging
@@ -10,9 +12,11 @@ from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from verl.protocol import DataProto
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.lora_utils import ADAPTER_NAME_PREFIX
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler.performance import reduce_timing, simple_timer, topk_reduce_ratio_min_max
 from verl.utils.profiler.profile import DistProfiler
+from verl.workers.actor.multi_lora_dp_actor import MultiLoraDPActor
 from verl.workers.config.engine import FSDPEngineConfig
 from verl.workers.config.model import HFModelConfig
 from verl.workers.config.rollout import RolloutConfig
@@ -28,7 +32,7 @@ from verl.utils.model import convert_weight_keys, print_model_size, get_generati
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils import hf_tokenizer, hf_processor
 from verl.utils.torch_dtypes import PrecisionType
-from verl.utils.fsdp_utils import collect_lora_params, collect_task_lora_params, fsdp_version, get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager, apply_fsdp2, fsdp2_load_full_state_dict, get_shard_placement_fn, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu, offload_fsdp_optimizer, replace_lora_wrapper
+from verl.utils.fsdp_utils import collect_lora_params, collect_task_lora_params, fsdp_version, get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager, apply_fsdp2, fsdp2_load_full_state_dict, get_shard_placement_fn, layered_summon_task_lora_params, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu, offload_fsdp_optimizer, replace_lora_wrapper
 from verl.utils.import_utils import import_external_libs
 from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.activation_offload import enable_activation_offloading
@@ -38,6 +42,8 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelF
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 import warnings
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+import torch.distributed as dist
+from safetensors.torch import save_file
 
 try:
     # for torch 2.5+
@@ -48,8 +54,6 @@ except ImportError:
 from verl.workers.rollout.vllm_rollout.multilora_vllm_rollout import MultiLoraVLLMRollout
 
 logger = logging.getLogger(__file__)
-
-ADAPTER_NAME_PREFIX = "lora_"
 
 class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
     def __init__(self, config, tasks_config: dict, role, **kwargs):
@@ -116,8 +120,11 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+            # self.actor = DataParallelPPOActor(
+            #     config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+            # )
+            self.actor = MultiLoraDPActor(
+                config=actor_cfg, actor_module=self.actor_module_fsdp, task_optimizers=self.task_optimizers
             )
 
         if self._is_rollout:
@@ -153,7 +160,7 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
             self.flops_counter = FlopsCounter(self.actor_model_config)
             self.checkpoint_manager = FSDPCheckpointManager(
                 model=self.actor_module_fsdp,
-                optimizer=self.actor.actor_optimizer,
+                optimizer=next(iter(self.actor.task_optimizers.values())),
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=self.config.actor.checkpoint,
@@ -685,7 +692,11 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
                     )
                     actor_module.add_adapter(adapter_name, lora_config)
 
-        print("peft config:", actor_module.peft_config)
+        print("[Worker build model] peft config:", actor_module.peft_config)
+
+        print("actor module params:")
+        for name, p in actor_module.named_parameters():
+            print(name, p.shape, p.requires_grad)
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -731,6 +742,8 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
         fsdp_mesh = self.device_mesh
         fsdp_enable_zero3 = fsdp_config.reshard_after_forward
         sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_enable_zero3)
+
+        self.use_orig_params = True
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -782,14 +795,18 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
 
         log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
 
+        print("FSDP module params:")
+        for name, p in actor_module_fsdp.named_parameters():
+            print(name, p.shape, p.requires_grad)
+
         # Create Optimizers for each task
         if role == "actor" and optim_config is not None:
             for task_id in self.tasks_config.keys():
                 actor_module_fsdp.set_adapter(ADAPTER_NAME_PREFIX + str(task_id))
 
                 print("building optimizer for task:", task_id)
-                # for n, p in actor_module_fsdp.named_parameters():
-                #     print(n, p.requires_grad, p.grad, p.numel())
+                for n, p in actor_module_fsdp.named_parameters():
+                    print(n, p.shape, p.requires_grad, p.grad, p.numel())
 
                 # task_params = [
                 #     p for p in actor_module_fsdp.parameters()
@@ -803,6 +820,9 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
                 else:
                     task_optim_config = optim_config
                 optimizer = build_optimizer(actor_module_fsdp.parameters(), task_optim_config)
+
+                # print("optimizer groups:", optimizer.param_groups)
+                
                 
                 # Create scheduler
                 total_steps = task_optim_config.get("total_training_steps", 0)
@@ -846,7 +866,8 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
     def generate_sequences_multi_lora(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
-        print("multi-lora worker generate.")
+        print(f"rank {dist.get_rank()} multi-lora worker generate.")
+        print(f"cur batch size: {len(prompts)}")
         prompts = prompts.to(get_device_id())
 
         meta_info = {
@@ -861,10 +882,11 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.rollout_mode())
-            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            with simple_timer("rollout_mode", timing_generate):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.rollout_mode())
+                log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences_multi_lora", timing_generate):
             output = self.rollout.generate_sequences_multi_lora(prompts)
@@ -909,6 +931,7 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
         adapter_params = {}
         for adapter_name in peft_config.keys():
             lora_config = peft_config[adapter_name]
+            # print(f"[DEBUG] adapter {adapter_name} lora config: {lora_config}")
             params = collect_task_lora_params(
                 module=self.actor_module_fsdp,
                 layered_summon=self.config.rollout.get("layered_summon", False),
@@ -924,7 +947,9 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
 
             adapter_params[adapter_name] = params
 
-            print(f"adapter {adapter_name} params: {len(params)}")
+            print(f"[DEBUG] adapter {adapter_name} params: {len(params)} {type(params)}")
+            # for k in params.keys():
+            #     print(f"{k}: {params[k].shape}")
 
         # Special handling for LoRA with sleep_level=2:
         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
@@ -936,7 +961,7 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
                 layered_summon=self.layered_summon,
                 base_sync_done=False,
             )
-            # base_model_params = {replace_lora_wrapper(k, lora_config): v for k, v in base_model_params.items()}
+            base_model_params = {replace_lora_wrapper(k, lora_config): v for k, v in base_model_params.items()}
             base_model_params = convert_weight_keys(
                 base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
             )
@@ -991,6 +1016,56 @@ class MultiTaskActorRolloutRefWorker(ActorRolloutRefWorker):
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
 
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_checkpoint(self, local_path, task_id, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        from verl.utils.logger import log_with_rank
+
+        # only support save and load ckpt for actor
+        assert self._is_actor
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        self.checkpoint_manager.save_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+        )
+        dist.barrier()
+
+        if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
+            lora_save_path = os.path.join(local_path, "lora_adapter")
+            peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
+            peft_config = {}
+            adapter_name = ADAPTER_NAME_PREFIX + str(task_id)
+            if dist.get_rank() == 0:
+                os.makedirs(lora_save_path, exist_ok=True)
+                peft_config = asdict(peft_model.peft_config.get(adapter_name, {}))
+                peft_config["task_type"] = peft_config["task_type"].value
+                peft_config["peft_type"] = peft_config["peft_type"].value
+                peft_config["target_modules"] = list(peft_config["target_modules"])
+            try:
+                if fsdp_version(self.actor_module_fsdp) > 0:
+                    self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
+                    lora_params = layered_summon_task_lora_params(self.actor_module_fsdp, adapter_name)
+                    if dist.get_rank() == 0:
+                        save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
+                        with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                            json.dump(peft_config, f, ensure_ascii=False, indent=4)
+            except Exception as e:
+                log_with_rank(
+                    f"Save LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
+                )
+
+            dist.barrier()
+            log_with_rank(
+                f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}",
+                rank=dist.get_rank(),
+                logger=logger,
+                log_only_rank_0=True,
+            )
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
 
 class MultiTaskCriticWorker(CriticWorker):

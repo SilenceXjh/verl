@@ -308,10 +308,10 @@ class MultiLoraDPActor(BasePPOActor):
 
             return entropy, log_probs
 
-    def _optimizer_step(self):
+    def _optimizer_step(self, task_id):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
-            self.scaler.unscale_(self.actor_optimizer)
+            self.scaler.unscale_(self.task_optimizers[task_id])
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
@@ -324,14 +324,14 @@ class MultiLoraDPActor(BasePPOActor):
 
         # if grad_norm is not finite, skip the update
         if self.scaler is not None:
-            self.scaler.step(self.actor_optimizer)
+            self.scaler.step(self.task_optimizers[task_id])
             self.scaler.update()
         else:
             if not torch.isfinite(grad_norm):
                 print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-                self.actor_optimizer.zero_grad()
+                self.task_optimizers[task_id].zero_grad()
             else:
-                self.actor_optimizer.step()
+                self.task_optimizers[task_id].step()
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -451,7 +451,7 @@ class MultiLoraDPActor(BasePPOActor):
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
+                self.task_optimizers[task_id].zero_grad()
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -554,8 +554,8 @@ class MultiLoraDPActor(BasePPOActor):
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                grad_norm = self._optimizer_step(task_id)
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
-        self.actor_optimizer.zero_grad()
+        self.task_optimizers[task_id].zero_grad()
         return metrics

@@ -133,10 +133,11 @@ class MultiLoraVLLMRollout(BaseRollout):
     ):
         super().__init__(config, model_config, device_mesh)
 
-        if config.layered_summon:
-            self.sleep_level = 1
-        else:
-            self.sleep_level = VLLM_SLEEP_LEVEL
+        # if config.layered_summon:
+        #     self.sleep_level = 1
+        # else:
+        #     self.sleep_level = VLLM_SLEEP_LEVEL
+        self.sleep_level = 1
 
         model_path = model_config.local_path
         tokenizer = model_config.tokenizer

@@ -17,8 +17,7 @@ tasks:
       filter_overlong_prompts: true
     actor_rollout_ref:
       rollout:
-        agent:
-          num_workers: 1
+        n: 5
       model:
         lora_rank: 16
         lora_alpha: 32
@@ -40,8 +39,7 @@ tasks:
       filter_overlong_prompts: true
     actor_rollout_ref:
       rollout:
-        agent:
-          num_workers: 1
+        n: 5
       model:
         lora_rank: 32
         lora_alpha: 64
